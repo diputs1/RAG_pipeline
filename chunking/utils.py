@@ -12,6 +12,73 @@ import re
 from langchain_core.documents import Document
 
 
+def clean_text(
+    text: str,
+    *,
+    remove_extra_spaces: bool = True,
+    remove_urls_emails: bool = False,
+) -> str:
+    """Clean extracted text before chunking, following Dify's conservative defaults."""
+    text = re.sub(r"<\|", "<", text)
+    text = re.sub(r"\|>", ">", text)
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\xEF\xBF\xBE]", "", text)
+    text = re.sub("\ufffe", "", text)
+
+    if remove_extra_spaces:
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"[\t\f\r\x20\u00a0\u1680\u180e\u2000-\u200a\u202f\u205f\u3000]{2,}", " ", text)
+
+    if remove_urls_emails:
+        text = re.sub(r"([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)", "", text)
+
+        markdown_link_pattern = r"\[([^\]]*)\]\((https?://[^)]+)\)"
+        markdown_image_pattern = r"!\[.*?\]\((https?://[^)]+)\)"
+        placeholders: list[tuple[str, str, str]] = []
+
+        def replace_markdown_link(match, placeholders=placeholders):
+            placeholder = f"__MARKDOWN_PLACEHOLDER_{len(placeholders)}__"
+            placeholders.append(("link", match.group(1), match.group(2)))
+            return placeholder
+
+        def replace_markdown_image(match, placeholders=placeholders):
+            placeholder = f"__MARKDOWN_PLACEHOLDER_{len(placeholders)}__"
+            placeholders.append(("image", "image", match.group(1)))
+            return placeholder
+
+        text = re.sub(markdown_link_pattern, replace_markdown_link, text)
+        text = re.sub(markdown_image_pattern, replace_markdown_image, text)
+        text = re.sub(r"https?://\S+", "", text)
+
+        for i, (kind, label, url) in enumerate(placeholders):
+            placeholder = f"__MARKDOWN_PLACEHOLDER_{i}__"
+            replacement = f"[{label}]({url})" if kind == "link" else f"![{label}]({url})"
+            text = text.replace(placeholder, replacement)
+
+    return text
+
+
+def clean_documents(
+    docs: list[Document],
+    *,
+    remove_extra_spaces: bool = True,
+    remove_urls_emails: bool = False,
+) -> list[Document]:
+    """Return new Documents with cleaned page_content and copied metadata."""
+    cleaned: list[Document] = []
+    for doc in docs:
+        cleaned.append(
+            Document(
+                page_content=clean_text(
+                    doc.page_content,
+                    remove_extra_spaces=remove_extra_spaces,
+                    remove_urls_emails=remove_urls_emails,
+                ),
+                metadata=dict(doc.metadata),
+            )
+        )
+    return cleaned
+
+
 def call_llm(prompt: str, provider: str, model: str, max_tokens: int = 1024) -> str:
     """
     Call an LLM and return the raw text response.

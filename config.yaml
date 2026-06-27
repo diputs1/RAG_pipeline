@@ -132,6 +132,15 @@ indexing:
     chunk_size: 1000          # Số ký tự mỗi chunk (hoặc số token nếu dùng token_based)
     chunk_overlap: 150        # Số ký tự chồng lấp giữa chunk liền kề
 
+    # Cleaning trước khi chunking — lấy cảm hứng từ Dify:
+    # - Xoá ký tự control/lỗi OCR
+    # - Gom dòng/khoảng trắng dư
+    # - Có thể xoá URL/email nhưng vẫn giữ Markdown link/image
+    cleaning:
+      enabled: true
+      remove_extra_spaces: true
+      remove_urls_emails: false
+
     # Tham số cho "token_based":
     token_encoding: cl100k_base       # "cl100k_base" (GPT-4) | "p50k_base"
 

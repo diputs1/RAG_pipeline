@@ -22,6 +22,7 @@ from typing import Any
 from langchain_core.documents import Document
 
 from chunking.base import BaseChunker
+from chunking.utils import clean_documents
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,14 @@ def chunk_documents_from_config(docs: list[Document], cfg: dict) -> list[Documen
     """
     chunk_cfg = cfg["indexing"]["chunking"]
     strategy  = chunk_cfg.get("strategy", "recursive")
+    clean_cfg = chunk_cfg.get("cleaning", {})
+
+    if clean_cfg.get("enabled", True):
+        docs = clean_documents(
+            docs,
+            remove_extra_spaces=clean_cfg.get("remove_extra_spaces", True),
+            remove_urls_emails=clean_cfg.get("remove_urls_emails", False),
+        )
 
     kwargs: dict[str, Any] = {
         "chunk_size":    chunk_cfg.get("chunk_size",    500),
