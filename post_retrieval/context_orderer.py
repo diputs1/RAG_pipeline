@@ -16,6 +16,8 @@ reverse   : Ascending relevance (most relevant LAST).
 sandwich  : Most relevant at START and END; least relevant in the middle.
             Maximises the chance that at least one highly-relevant chunk
             falls in a well-attended position. ← Recommended default.
+dify_reorder : Keep rank order for positions 0,2,4... and append positions
+               1,3,5... in reverse, matching Dify's lightweight reorder.
 original  : Keep the order returned by the retriever unchanged.
 
 Use when: context window contains many chunks and generation quality
@@ -35,7 +37,7 @@ class ContextOrderer(BasePostProcessor):
 
     Parameters
     ----------
-    ordering  : "relevance" | "reverse" | "sandwich" | "original"
+    ordering  : "relevance" | "reverse" | "sandwich" | "dify_reorder" | "original"
     score_key : Metadata key holding the relevance score.
                 Falls back through rerank_score → relevance_score → rrf_score.
     """
@@ -76,5 +78,9 @@ class ContextOrderer(BasePostProcessor):
             mid   = sorted_docs[1:-1]
             half  = len(mid) // 2
             return [best] + mid[:half] + list(reversed(mid[half:])) + [worst]
+
+        if self.ordering == "dify_reorder":
+            sorted_docs = sorted(docs, key=get_score, reverse=True)
+            return sorted_docs[::2] + sorted_docs[1::2][::-1]
 
         return docs

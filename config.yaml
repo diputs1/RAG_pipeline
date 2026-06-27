@@ -358,6 +358,7 @@ query_pipeline:
     #   "relevance"  Giảm dần theo score
     #   "reverse"    Tăng dần (chunk tốt nhất ở cuối)
     #   "original"   Giữ nguyên thứ tự từ retriever
+    #   "dify_reorder" Dify-style: 0,2,4... then reversed 1,3,5...
     context_ordering: sandwich
 
   # ---------------------------------------------------------------------------
