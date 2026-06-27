@@ -9,16 +9,44 @@ from __future__ import annotations
 from langchain_core.documents import Document
 
 
+_SCORE_KEYS = ("rerank_score", "relevance_score", "rrf_score", "hybrid_score", "bm25_score", "score")
+
+
+def _dedup_key(doc: Document) -> tuple[str, str]:
+    doc_id = doc.metadata.get("doc_id") or doc.metadata.get("id")
+    source = doc.metadata.get("source") or doc.metadata.get("document_id") or ""
+    if doc_id:
+        return ("id", f"{source}:{doc_id}")
+    return ("content", doc.page_content.strip())
+
+
+def _best_score(doc: Document) -> float:
+    for key in _SCORE_KEYS:
+        value = doc.metadata.get(key)
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
 def deduplicate(docs: list[Document]) -> list[Document]:
-    """Remove exact-duplicate documents (same stripped page_content)."""
-    seen:   set[str]       = set()
-    unique: list[Document] = []
+    """Deduplicate by document id when present, otherwise by content.
+
+    If a duplicate id appears later with a better retrieval score, keep the
+    stronger candidate while preserving the first-seen position.
+    """
+    chosen: dict[tuple[str, str], Document] = {}
+    order: list[tuple[str, str]] = []
+
     for doc in docs:
-        key = doc.page_content.strip()
-        if key not in seen:
-            seen.add(key)
-            unique.append(doc)
-    return unique
+        key = _dedup_key(doc)
+        if key not in chosen:
+            chosen[key] = doc
+            order.append(key)
+            continue
+        if _best_score(doc) > _best_score(chosen[key]):
+            chosen[key] = doc
+
+    return [chosen[key] for key in order]
 
 
 def call_llm(
