@@ -9,6 +9,7 @@ Khởi động: streamlit run app_visualizer.py
 import importlib
 import importlib.util
 import inspect
+import hashlib
 import os
 import sys
 import re
@@ -64,7 +65,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # ─── Hằng số & cấu hình UI ────────────────────────────────────────────────────
 
-PAGE_TITLE = "RAG Pipeline Visualizer"
+PAGE_TITLE = "Vin Assistant"
 
 # Màu nhãn theo loại file
 FILE_TYPE_COLORS = {
@@ -441,7 +442,14 @@ _IMPORT_ERROR_HINTS: dict[str, str] = {
     "pytesseract":            "pip install pytesseract Pillow",
     "paddleocr":              "pip install paddlepaddle paddleocr",
     "ebooklib":               "pip install ebooklib beautifulsoup4",
+    "bs4":                    "pip install beautifulsoup4 lxml requests",
+    "lxml":                   "pip install lxml",
+    "requests":               "pip install requests",
 }
+
+
+def _split_lines_or_commas(value: str) -> list[str]:
+    return [part.strip() for part in re.split(r"[,\n]+", value or "") if part.strip()]
 
 
 def _friendly_import_error(exc: ModuleNotFoundError) -> str:
@@ -461,6 +469,7 @@ def run_loader(
     pdf_strategy:    str,
     extract_tables:  bool,
     language:        str,
+    source_type:     str  = "file",
     marker_device:   str  = "cpu",
     describe_images: bool = False,
     vision_model:    str  = "gpt-4o-mini",
@@ -468,8 +477,31 @@ def run_loader(
     ollama_base_url: str  = "http://localhost:11434/v1",
     odl_hybrid:      str | None = None,
     odl_struct_tree: bool = False,
+    web_max_depth:   int = 1,
+    web_max_pages:   int = 8,
+    web_include_keywords: list[str] | None = None,
+    web_exclude_patterns: list[str] | None = None,
 ) -> list:
-    """Chạy PDFDocumentLoader và trả về list[Document]."""
+    """Chạy loader theo source_type và trả về list[Document]."""
+    if source_type == "web":
+        try:
+            from loader.web_loader import VinWondersWebLoader
+
+            loader = VinWondersWebLoader(
+                language=language,
+                max_depth=web_max_depth,
+                max_pages=web_max_pages,
+                include_keywords=web_include_keywords,
+                exclude_patterns=web_exclude_patterns,
+            )
+            return loader.load(source_path)
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                f"{_friendly_import_error(exc)}\n\n"
+                f"[Debug] Lỗi thật: {type(exc).__name__}: {exc}\n"
+                f"[Debug] sys.executable: {__import__('sys').executable}"
+            ) from exc
+
     from loader.directory_loader import PDFDocumentLoader
 
     loader = PDFDocumentLoader(
@@ -795,6 +827,146 @@ def run_embedder(
         "n_embedded": len(dense),
         "truncated":  len(chunks) > max_chunks,
     }
+
+
+def _embedder_kwargs_from_cfg(emb_cfg: dict) -> dict:
+    """Build safe get_embedder kwargs for reconnecting vector stores."""
+    provider = emb_cfg["provider"]
+    model_name = emb_cfg["model_name"]
+    extra: dict = {}
+    if provider == "openai":
+        dims = emb_cfg.get("dimensions")
+        if dims:
+            extra["dimensions"] = dims
+    elif provider == "cohere":
+        extra["input_type"] = emb_cfg.get("input_type", "search_document")
+    elif provider == "ollama":
+        extra["base_url"] = emb_cfg.get("ollama_base_url", "http://localhost:11434")
+    elif provider == "huggingface":
+        extra["device"] = emb_cfg.get("device", "cpu")
+    return {"provider": provider, "model_name": model_name, **extra}
+
+
+def _build_pipeline_cache_state(
+    cache: PipelineCache,
+    source_path: str,
+    loader_cfg: dict,
+    strategy: str,
+    chunk_size: int,
+    chunk_overlap: int,
+    extra_kwargs: dict,
+    emb_cfg: dict,
+    vdb_cfg: dict,
+) -> dict:
+    """Compute the same cache keys used by Process without running pipeline steps."""
+    loader_cfg_for_cache = {k: v for k, v in loader_cfg.items()
+                            if k not in ("ollama_base_url",)}
+    if loader_cfg.get("source_type") == "web":
+        input_hash = cache.compute_web_input_hash(source_path, loader_cfg_for_cache)
+    else:
+        input_hash = cache.compute_input_hash(source_path)
+
+    chunk_cfg_for_cache = {
+        "strategy":      strategy,
+        "chunk_size":    chunk_size,
+        "chunk_overlap": chunk_overlap,
+        **{k: v for k, v in extra_kwargs.items() if k not in {"ollama_base_url"}},
+    }
+
+    embed_cfg_for_cache = {
+        k: v for k, v in emb_cfg.items()
+        if k not in {
+            "skip", "dims", "max_preview", "ollama_base_url", "device",
+            "torch_dtype_str", "batch_size",
+        }
+    }
+
+    vdb_cfg_for_cache = {
+        k: v for k, v in vdb_cfg.items()
+        if k not in {
+            "skip", "force_reindex",
+            "url", "uri", "redis_url", "connection_string",
+            "endpoint", "api_key", "user", "password", "token",
+        }
+    }
+
+    loader_key = cache.make_step_key(input_hash, loader_cfg_for_cache)
+    chunk_key = cache.make_step_key(loader_key, chunk_cfg_for_cache)
+    embed_key = cache.make_step_key(chunk_key, embed_cfg_for_cache)
+    vdb_key = cache.make_step_key(embed_key, vdb_cfg_for_cache)
+    return {
+        "input_hash": input_hash,
+        "loader_cfg_for_cache": loader_cfg_for_cache,
+        "chunk_cfg_for_cache": chunk_cfg_for_cache,
+        "embed_cfg_for_cache": embed_cfg_for_cache,
+        "vdb_cfg_for_cache": vdb_cfg_for_cache,
+        "loader_key": loader_key,
+        "chunk_key": chunk_key,
+        "embed_key": embed_key,
+        "vdb_key": vdb_key,
+        "signature": "|".join([input_hash, loader_key, chunk_key, embed_key, vdb_key]),
+    }
+
+
+def _connect_vector_store_from_cache(chunks: list, emb_cfg: dict, vdb_cfg: dict):
+    """Reconnect to an already persisted vector store without re-embedding."""
+    from embedding.factory import get_embedder
+    from vector_db import get_vector_store
+
+    embedder = get_embedder(**_embedder_kwargs_from_cfg(emb_cfg))
+    provider = vdb_cfg["provider"]
+    conn_kwargs = {
+        k: v for k, v in vdb_cfg.items()
+        if k not in ("provider", "skip", "force_reindex")
+    }
+    return get_vector_store(
+        provider=provider,
+        chunks=chunks,
+        embedder=embedder,
+        force_reindex=False,
+        **conn_kwargs,
+    )
+
+
+def _restore_cached_pipeline_if_available(
+    cache: PipelineCache,
+    cache_state: dict,
+    emb_cfg: dict,
+    vdb_cfg: dict,
+) -> bool:
+    """Restore docs/chunks/embedding metadata/vector store into Streamlit session."""
+    if emb_cfg.get("skip") or vdb_cfg.get("skip") or vdb_cfg.get("force_reindex"):
+        return False
+    if (
+        st.session_state.get("_restored_cache_signature") == cache_state["signature"]
+        and "vdb_result" in st.session_state
+    ):
+        return True
+
+    input_hash = cache_state["input_hash"]
+    docs = cache.load_loader(input_hash, cache_state["loader_key"])
+    chunks = cache.load_chunking(input_hash, cache_state["chunk_key"])
+    embed_result = cache.load_embedding(input_hash, cache_state["embed_key"])
+    cached_vdb = cache.load_vector_db(input_hash, cache_state["vdb_key"])
+    if docs is None or chunks is None or embed_result is None or cached_vdb is None:
+        return False
+
+    store = _connect_vector_store_from_cache(chunks, emb_cfg, vdb_cfg)
+    st.session_state["loader_docs"] = docs
+    st.session_state["chunks"] = chunks
+    st.session_state["embed_result"] = embed_result
+    st.session_state["emb_cfg_used"] = emb_cfg
+    st.session_state["vdb_result"] = {
+        "store": store,
+        "n_vectors": cached_vdb.get("n_vectors", len(chunks)),
+        "collection_name": cached_vdb.get("collection_name", vdb_cfg.get("collection_name", "rag")),
+        "provider": vdb_cfg.get("provider", cached_vdb.get("provider", "")),
+        "loaded_from_existing": True,
+    }
+    st.session_state["vdb_cfg_used"] = vdb_cfg
+    st.session_state["active_tab"] = 4
+    st.session_state["_restored_cache_signature"] = cache_state["signature"]
+    return True
 
 
 @st.cache_resource
@@ -1431,9 +1603,72 @@ def _render_vlm_panel(key_prefix: str) -> None:
                     st.caption("Đảm bảo Ollama đang chạy: `ollama serve`")
 
 
-def render_loader_settings() -> dict:
+def render_loader_settings(source_type: str = "file") -> dict:
     """Hiển thị panel cài đặt loader, trả về dict các tham số."""
     st.subheader("⚙️ Cài đặt Loader")
+
+    if source_type == "web":
+        from loader.web_loader import (
+            DEFAULT_EXCLUDE_PATTERNS,
+            DEFAULT_INCLUDE_KEYWORDS,
+        )
+
+        st.info(
+            "Website mode sẽ crawl trang Vinpearl Safari và tối đa 1 cấp link liên quan. "
+            "Các link booking, affiliate, static asset và quảng cáo chung được bỏ qua.",
+            icon="🌐",
+        )
+        col1, col2 = st.columns(2)
+        with col1:
+            language = st.selectbox(
+                "Ngôn ngữ corpus",
+                options=["vi", "both", "en"],
+                index=0,
+                key="web_language",
+            )
+            max_depth = st.number_input(
+                "Crawl depth",
+                min_value=0, max_value=2, value=1, step=1,
+                key="web_max_depth",
+                help="MVP local khuyến nghị 1: lấy trang chính và link con liên quan trực tiếp.",
+            )
+        with col2:
+            max_pages = st.number_input(
+                "Max pages",
+                min_value=1, max_value=30, value=8, step=1,
+                key="web_max_pages",
+            )
+        include_raw = st.text_area(
+            "Include keywords",
+            value=", ".join(DEFAULT_INCLUDE_KEYWORDS),
+            key="web_include_keywords",
+            height=80,
+            help="URL hoặc anchor text chứa các từ này mới được đưa vào hàng đợi crawl.",
+        )
+        exclude_raw = st.text_area(
+            "Exclude patterns",
+            value=", ".join(DEFAULT_EXCLUDE_PATTERNS),
+            key="web_exclude_patterns",
+            height=100,
+            help="Bỏ qua booking, login, affiliate, static asset và các ưu đãi chung không liên quan Safari.",
+        )
+        return {
+            "source_type": "web",
+            "pdf_strategy": "web",
+            "extract_tables": False,
+            "language": language,
+            "marker_device": "cpu",
+            "describe_images": False,
+            "vision_model": "gpt-4o-mini",
+            "vision_provider": "openai",
+            "ollama_base_url": "http://localhost:11434/v1",
+            "odl_hybrid": None,
+            "odl_struct_tree": False,
+            "max_depth": int(max_depth),
+            "max_pages": int(max_pages),
+            "include_keywords": _split_lines_or_commas(include_raw),
+            "exclude_patterns": _split_lines_or_commas(exclude_raw),
+        }
 
     col1, col2 = st.columns(2)
     with col1:
@@ -1633,7 +1868,7 @@ def render_loader_settings() -> dict:
 
 # ─── UI: Chunking settings panel ──────────────────────────────────────────────
 
-def render_chunking_settings(local_only: bool = False) -> tuple[str, int, int, dict]:
+def render_chunking_settings(local_only: bool = False, source_type: str = "file") -> tuple[str, int, int, dict]:
     """Hiển thị panel cài đặt chunking, trả về (strategy, chunk_size, overlap, extra)."""
     st.subheader("✂️ Cài đặt Chunking")
 
@@ -1672,18 +1907,20 @@ def render_chunking_settings(local_only: bool = False) -> tuple[str, int, int, d
     _defer_size = (strategy == "format_aware")
 
     if not _defer_size:
+        default_chunk_size = 900 if source_type == "web" else 500
+        default_overlap = 120 if source_type == "web" else 100
         col1, col2 = st.columns(2)
         with col1:
             chunk_size = st.number_input(
                 "Chunk size (chars)",
-                min_value=50, max_value=8000, value=500, step=50,
+                min_value=50, max_value=8000, value=default_chunk_size, step=50,
                 disabled=_no_size,
                 help="Kích thước tối đa mỗi chunk (tính bằng ký tự)"
             )
         with col2:
             chunk_overlap = st.number_input(
                 "Chunk overlap (chars)",
-                min_value=0, max_value=2000, value=100, step=25,
+                min_value=0, max_value=2000, value=default_overlap, step=25,
                 disabled=_no_size,
                 help="Số ký tự chồng lấp giữa các chunk liên tiếp"
             )
@@ -2347,7 +2584,11 @@ def render_embedding_settings(local_only: bool = False, force_skip: bool = False
 # ─── UI: Vector DB settings panel ────────────────────────────────────────────
 
 
-def render_vector_db_settings(local_only: bool = False, force_skip: bool = False) -> dict:
+def render_vector_db_settings(
+    local_only: bool = False,
+    force_skip: bool = False,
+    source_type: str = "file",
+) -> dict:
     """
     Hiển thị panel cài đặt Vector Database trong sidebar.
     Trả về dict cấu hình để truyền vào get_vector_store().
@@ -2410,9 +2651,10 @@ def render_vector_db_settings(local_only: bool = False, force_skip: bool = False
                 st.caption(f"📦 Cần cài: `{meta['install']}`")
 
     # ── Common params ───────────────────────────────────────────────────────
+    default_collection_name = "vinpearl_safari_phu_quoc" if source_type == "web" else "rag"
     collection_name = st.text_input(
         "Collection / Index name",
-        value="rag",
+        value=default_collection_name,
         key="vdb_collection_name",
         help="Tên collection/index trong vector DB. Mặc định: 'rag'.",
     )
@@ -2802,6 +3044,7 @@ def render_query_pipeline_results(
     emb_cfg:    dict,
     prompt_cfg: dict | None = None,
     gen_cfg:    dict | None = None,
+    voice_cfg:  dict | None = None,
     history:    list[dict] | None = None,
 ):
     """
@@ -2811,6 +3054,7 @@ def render_query_pipeline_results(
     prompt_cfg = prompt_cfg or {"template": "citation", "language": "both"}
     gen_cfg    = gen_cfg    or {"provider": "openai", "model_name": "gpt-4.1-mini",
                                 "temperature": 0.0, "max_tokens": 2048, "streaming": True}
+    voice_cfg  = voice_cfg  or {}
     vector_store = vdb_result.get("store")
     if vector_store is None:
         st.warning("Vector store chưa khả dụng — chạy Process trước.")
@@ -3049,6 +3293,38 @@ def render_query_pipeline_results(
         st.error(f"Generation lỗi: {e}")
         st.exception(e)
         return
+
+    if voice_cfg.get("enable_tts"):
+        st.markdown("")
+        st.markdown("**🔊 Voice answer:**")
+        api_key = _get_env("ELEVENLABS_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
+        if not api_key:
+            st.warning("⚠️ Cần `ELEVENLABS_API_KEY` để đọc câu trả lời bằng ElevenLabs.")
+        elif not gen_result.answer.strip():
+            st.caption("Không có nội dung để đọc.")
+        else:
+            try:
+                from voice.elevenlabs_tts import synthesize_speech
+
+                cache_key = hashlib.sha256(
+                    (gen_result.answer + repr(voice_cfg)).encode("utf-8")
+                ).hexdigest()
+                audio_cache = st.session_state.setdefault("_tts_audio_cache", {})
+                if cache_key not in audio_cache:
+                    with st.spinner("Đang tạo audio ElevenLabs..."):
+                        audio_cache[cache_key] = synthesize_speech(
+                            gen_result.answer,
+                            api_key=api_key,
+                            voice_id=voice_cfg.get("voice_id", "pNInz6obpgDQGcFmaJgB"),
+                            model_id=voice_cfg.get("model_id", "eleven_flash_v2_5"),
+                            output_format=voice_cfg.get("output_format", "mp3_22050_32"),
+                            stability=voice_cfg.get("stability", 0.35),
+                            similarity_boost=voice_cfg.get("similarity_boost", 0.85),
+                            speed=voice_cfg.get("speed", 1.0),
+                        )
+                st.audio(audio_cache[cache_key], format="audio/mp3")
+            except Exception as e:
+                st.warning(f"⚠️ ElevenLabs TTS lỗi: {e}")
 
     # ── Metadata: token usage + citations ────────────────────────────────────
     meta_cols = st.columns(4)
@@ -3784,14 +4060,26 @@ def main():
         st.header("📁 Nguồn dữ liệu")
 
         input_method = st.radio(
-            "Cách chọn file",
-            ["Upload file(s)", "Nhập đường dẫn"],
-            help="Upload: kéo thả file trực tiếp\nĐường dẫn: nhập path tuyệt đối"
+            "Nguồn dữ liệu",
+            ["Website URL", "Upload file(s)", "Nhập đường dẫn"],
+            help="Website URL: crawl trang web\nUpload: kéo thả file trực tiếp\nĐường dẫn: nhập path tuyệt đối",
         )
 
         source_path: str | None = None
+        source_type = "web" if input_method == "Website URL" else "file"
 
-        if input_method == "Upload file(s)":
+        if input_method == "Website URL":
+            from loader.web_loader import DEFAULT_SEED_URL
+
+            source_path = st.text_input(
+                "URL website",
+                value=DEFAULT_SEED_URL,
+                key="web_source_url",
+                help="Mặc định là trang Vinpearl Safari Phú Quốc. Loader sẽ crawl thêm link con liên quan.",
+            ).strip()
+            if source_path:
+                st.success("✅ Website URL đã sẵn sàng để crawl")
+        elif input_method == "Upload file(s)":
             uploaded = st.file_uploader(
                 "Chọn 1 hoặc nhiều file",
                 accept_multiple_files=True,
@@ -3830,12 +4118,15 @@ def main():
         st.markdown("---")
 
         # ── Loader settings ─────────────────────────────────────────────────
-        loader_cfg = render_loader_settings()
+        loader_cfg = render_loader_settings(source_type=source_type)
 
         st.markdown("---")
 
         # ── Chunking settings ────────────────────────────────────────────────
-        strategy, chunk_size, chunk_overlap, extra_kwargs = render_chunking_settings(local_only=local_only)
+        strategy, chunk_size, chunk_overlap, extra_kwargs = render_chunking_settings(
+            local_only=local_only,
+            source_type=source_type,
+        )
 
         st.markdown("---")
 
@@ -3853,6 +4144,7 @@ def main():
         vdb_cfg = render_vector_db_settings(
             local_only=local_only,
             force_skip=_emb_skipped,
+            source_type=source_type,
         )
 
         st.markdown("---")
@@ -4129,6 +4421,138 @@ def main():
                 "streaming":   gen_streaming,
                 "base_url":    gen_ollama_url,
                 "auto_pull":   gen_auto_pull,
+            }
+
+        with st.expander("1️⃣2️⃣ Voice agent local", expanded=False):
+            st.info(
+                "MVP local dùng pipeline: ghi âm câu hỏi → local faster-whisper STT → RAG → TTS đọc câu trả lời. "
+                "Không cần WebSocket; ElevenLabs STT chỉ là fallback tùy chọn.",
+                icon="🎙️",
+            )
+            stt_backend = st.selectbox(
+                "STT backend",
+                ["local_faster_whisper", "elevenlabs"],
+                key="voice_stt_backend",
+                format_func=lambda v: {
+                    "local_faster_whisper": "Local faster-whisper (free/offline)",
+                    "elevenlabs": "ElevenLabs Scribe v2 (API fallback)",
+                }.get(v, v),
+            )
+            auto_run_voice = st.checkbox(
+                "Auto-run sau khi transcribe",
+                value=False,
+                key="voice_auto_run",
+            )
+            if stt_backend == "local_faster_whisper":
+                col_stt1, col_stt2 = st.columns(2)
+                with col_stt1:
+                    stt_model_size = st.selectbox(
+                        "Whisper model",
+                        ["base", "tiny", "small", "medium"],
+                        key="voice_stt_model_size",
+                        help="base là mặc định nhanh cho câu hỏi ngắn. tiny nhanh nhất; small chính xác hơn nhưng chậm hơn.",
+                    )
+                    stt_device = st.selectbox(
+                        "Device",
+                        ["cpu", "cuda"],
+                        key="voice_stt_device",
+                        help="CPU chạy được local; CUDA nếu máy có NVIDIA GPU.",
+                    )
+                with col_stt2:
+                    stt_compute_type = st.selectbox(
+                        "Compute type",
+                        ["int8", "float16", "float32"],
+                        key="voice_stt_compute_type",
+                        help="CPU nên dùng int8. CUDA thường dùng float16.",
+                    )
+                    stt_language = st.selectbox(
+                        "STT language",
+                        ["vi", "auto", "en"],
+                        key="voice_stt_language",
+                    )
+                col_fast1, col_fast2 = st.columns(2)
+                with col_fast1:
+                    stt_beam_size = st.slider(
+                        "Beam size",
+                        min_value=1,
+                        max_value=5,
+                        value=1,
+                        step=1,
+                        key="voice_stt_beam_size",
+                        help="1 nhanh nhất. Tăng lên 3-5 nếu audio khó nghe và cần chính xác hơn.",
+                    )
+                with col_fast2:
+                    stt_vad_filter = st.checkbox(
+                        "VAD filter",
+                        value=False,
+                        key="voice_stt_vad_filter",
+                        help="Tắt để giảm latency cho câu hỏi ngắn. Bật nếu audio nhiều khoảng lặng/nhiễu.",
+                    )
+                if importlib.util.find_spec("faster_whisper") is None:
+                    st.warning("⚠️ Cần cài `faster-whisper`: `pip install faster-whisper`.")
+                else:
+                    st.success("✅ `faster-whisper` đã sẵn sàng.")
+            else:
+                stt_model_size = "base"
+                stt_device = "cpu"
+                stt_compute_type = "int8"
+                stt_language = "vi"
+                stt_beam_size = 1
+                stt_vad_filter = False
+
+            enable_tts = st.checkbox(
+                "Voice answer (TTS)",
+                value=False,
+                key="voice_enable_tts",
+                help="Sau khi RAG có câu trả lời, ElevenLabs sẽ tạo audio MP3 để phát trong app.",
+            )
+            voice_id = st.text_input(
+                "Voice ID",
+                value="pNInz6obpgDQGcFmaJgB",
+                key="voice_tts_voice_id",
+                help="Default là Adam premade voice. Có thể thay bằng voice_id trong ElevenLabs account.",
+            )
+            voice_model = st.selectbox(
+                "TTS model",
+                ["eleven_flash_v2_5", "eleven_multilingual_v2"],
+                key="voice_tts_model",
+                help="Flash v2.5 ưu tiên latency; multilingual v2 thường tự nhiên hơn cho đa ngôn ngữ.",
+            )
+            output_format = st.selectbox(
+                "Output format",
+                ["mp3_22050_32", "mp3_44100_128", "mp3_44100_192"],
+                key="voice_tts_output_format",
+            )
+            col_v1, col_v2 = st.columns(2)
+            with col_v1:
+                stability = st.slider("Stability", 0.0, 1.0, 0.35, 0.05, key="voice_tts_stability")
+                speed = st.slider("Speed", 0.7, 1.2, 1.0, 0.05, key="voice_tts_speed")
+            with col_v2:
+                similarity = st.slider(
+                    "Similarity boost", 0.0, 1.0, 0.85, 0.05, key="voice_tts_similarity"
+                )
+            if enable_tts or stt_backend == "elevenlabs":
+                if _get_env("ELEVENLABS_API_KEY") or os.getenv("ELEVENLABS_API_KEY"):
+                    st.success("✅ `ELEVENLABS_API_KEY` đã được cấu hình.")
+                else:
+                    st.warning("⚠️ Cần `ELEVENLABS_API_KEY` cho ElevenLabs STT/TTS.")
+
+            st.session_state["voice_cfg"] = {
+                "stt_backend": stt_backend,
+                "auto_run": auto_run_voice,
+                "stt_model_size": stt_model_size,
+                "stt_device": stt_device,
+                "stt_compute_type": stt_compute_type,
+                "stt_language": None if stt_language == "auto" else stt_language,
+                "stt_beam_size": stt_beam_size,
+                "stt_vad_filter": stt_vad_filter,
+                "enable_tts": enable_tts,
+                "voice_id": voice_id,
+                "model_id": voice_model,
+                "output_format": output_format,
+                "stability": stability,
+                "similarity_boost": similarity,
+                "speed": speed,
             }
 
         st.markdown("---")
@@ -4543,6 +4967,35 @@ Nếu corpus thuần text ngữ nghĩa → Dense-only (FAISS, Chroma, LanceDB) t
 
         return
 
+    cache = _get_pipeline_cache()
+    cache_state: dict | None = None
+    if source_path:
+        try:
+            with st.spinner("🔍 Đang kiểm tra cache để nạp Query Pipeline..."):
+                cache_state = _build_pipeline_cache_state(
+                    cache=cache,
+                    source_path=source_path,
+                    loader_cfg=loader_cfg,
+                    strategy=strategy,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    extra_kwargs=extra_kwargs,
+                    emb_cfg=emb_cfg,
+                    vdb_cfg=vdb_cfg,
+                )
+                restored = _restore_cached_pipeline_if_available(
+                    cache=cache,
+                    cache_state=cache_state,
+                    emb_cfg=emb_cfg,
+                    vdb_cfg=vdb_cfg,
+                )
+            if restored and not st.session_state.get("_cache_restore_notice_shown"):
+                st.success("⚡ Đã nạp pipeline từ cache. Bạn có thể mở tab Query và hỏi ngay.")
+                st.session_state["_cache_restore_notice_shown"] = True
+        except Exception as exc:
+            if not process_btn:
+                st.caption(f"Không thể auto-load cache cho cấu hình hiện tại: {exc}")
+
     # ── Gợi ý cấu hình khi chưa có kết quả ─────────────────────────────────
     if "loader_docs" not in st.session_state:
         suggestions = get_pipeline_suggestions(source_path, local_only)
@@ -4554,57 +5007,28 @@ Nếu corpus thuần text ngữ nghĩa → Dense-only (FAISS, Chroma, LanceDB) t
         import threading, concurrent.futures
         import time as _time
 
-        cache = _get_pipeline_cache()
-
         # ── Tính toán keys cho toàn bộ chain ──────────────────────────────────
         with st.spinner("🔍 Đang kiểm tra cache..."):
-            input_hash  = cache.compute_input_hash(source_path)
-            loader_cfg_for_cache = {k: v for k, v in loader_cfg.items()
-                                    if k not in ("ollama_base_url",)}  # bỏ URL khỏi key
-            # Chunking: loại ollama_base_url khỏi extra_kwargs trước khi hash
-            # (URL không ảnh hưởng đến kết quả chunking, chỉ là địa chỉ server)
-            _CHUNK_URL_KEYS = {"ollama_base_url"}
-            chunk_cfg_for_cache = {
-                "strategy":      strategy,
-                "chunk_size":    chunk_size,
-                "chunk_overlap": chunk_overlap,
-                **{k: v for k, v in extra_kwargs.items() if k not in _CHUNK_URL_KEYS},
-            }
-            # Các key ảnh hưởng đến GIÁ TRỊ vector → phải nằm trong cache key
-            # Các key chỉ ảnh hưởng tốc độ/memory → KHÔNG nằm trong cache key
-            _EMBED_SPEED_PARAMS = {
-                "skip",            # meta flag
-                "dims",            # raw model dim, không phải target dim
-                "max_preview",     # số chunk embed trong preview, không ảnh hưởng vector
-                "ollama_base_url", # URL server, không ảnh hưởng model output
-                "device",          # cuda vs cpu → cùng vector, chỉ khác tốc độ
-                "torch_dtype_str", # fp16 vs fp32 → semantically same vectors
-                "batch_size",      # throughput param, zero effect on output
-            }
-            embed_cfg_for_cache = {
-                k: v for k, v in emb_cfg.items()
-                if k not in _EMBED_SPEED_PARAMS
-            }
-
-            # Vector DB: chỉ các param ảnh hưởng đến *cấu trúc dữ liệu* trong DB
-            # (loại bỏ URL/connection details vì chúng là "where" chứ không phải "what")
-            _VDB_INFRA_PARAMS = {
-                "skip",             # meta flag
-                "force_reindex",    # runtime flag
-                # connection details — thay đổi URL không đổi data
-                "url", "uri", "redis_url", "connection_string",
-                "endpoint", "api_key", "user", "password", "token",
-            }
-            vdb_cfg_for_cache = {
-                k: v for k, v in vdb_cfg.items()
-                if k not in _VDB_INFRA_PARAMS
-            }
-
-            loader_key = cache.make_step_key(input_hash,  loader_cfg_for_cache)
-            chunk_key  = cache.make_step_key(loader_key,  chunk_cfg_for_cache)
-            embed_key  = cache.make_step_key(chunk_key,   embed_cfg_for_cache)
-            # vdb_key chains từ embed_key → nếu embedding thay đổi, vdb cache tự động miss
-            vdb_key    = cache.make_step_key(embed_key,   vdb_cfg_for_cache)
+            cache_state = cache_state or _build_pipeline_cache_state(
+                cache=cache,
+                source_path=source_path,
+                loader_cfg=loader_cfg,
+                strategy=strategy,
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                extra_kwargs=extra_kwargs,
+                emb_cfg=emb_cfg,
+                vdb_cfg=vdb_cfg,
+            )
+            input_hash = cache_state["input_hash"]
+            loader_cfg_for_cache = cache_state["loader_cfg_for_cache"]
+            chunk_cfg_for_cache = cache_state["chunk_cfg_for_cache"]
+            embed_cfg_for_cache = cache_state["embed_cfg_for_cache"]
+            vdb_cfg_for_cache = cache_state["vdb_cfg_for_cache"]
+            loader_key = cache_state["loader_key"]
+            chunk_key = cache_state["chunk_key"]
+            embed_key = cache_state["embed_key"]
+            vdb_key = cache_state["vdb_key"]
 
         stop_event = threading.Event()
         st.session_state["_stop_event"] = stop_event
@@ -4631,6 +5055,7 @@ Nếu corpus thuần text ngữ nghĩa → Dense-only (FAISS, Chroma, LanceDB) t
             def _do_load():
                 return run_loader(
                     source_path=source_path,
+                    source_type=loader_cfg.get("source_type", "file"),
                     pdf_strategy=loader_cfg["pdf_strategy"],
                     extract_tables=loader_cfg["extract_tables"],
                     language=loader_cfg["language"],
@@ -4641,6 +5066,10 @@ Nếu corpus thuần text ngữ nghĩa → Dense-only (FAISS, Chroma, LanceDB) t
                     ollama_base_url=loader_cfg["ollama_base_url"],
                     odl_hybrid=loader_cfg.get("odl_hybrid"),
                     odl_struct_tree=loader_cfg.get("odl_struct_tree", False),
+                    web_max_depth=loader_cfg.get("max_depth", 1),
+                    web_max_pages=loader_cfg.get("max_pages", 8),
+                    web_include_keywords=loader_cfg.get("include_keywords"),
+                    web_exclude_patterns=loader_cfg.get("exclude_patterns"),
                 )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
@@ -4673,6 +5102,18 @@ Nếu corpus thuần text ngữ nghĩa → Dense-only (FAISS, Chroma, LanceDB) t
             cache.save_loader(input_hash, loader_key, docs, loader_cfg_for_cache, source_path)
             st.session_state["loader_docs"] = docs
             st.success(f"✅ Loading thành công: {len(docs)} document(s)")
+
+        if loader_cfg.get("source_type") == "web" and docs:
+            _crawl_meta = docs[0].metadata
+            _included = _crawl_meta.get("_crawl_included_urls", [])
+            _skipped = _crawl_meta.get("_crawl_skipped_urls", [])
+            with st.expander("🌐 Web crawl debug", expanded=False):
+                st.markdown(f"**Included URLs ({len(_included)}):**")
+                for _url in _included:
+                    st.caption(_url)
+                st.markdown(f"**Skipped URLs ({len(_skipped)} shown):**")
+                for _item in _skipped[:30]:
+                    st.caption(f"{_item.get('reason','skip')} · {_item.get('url','')}")
 
         # Hiển thị lỗi VLM nếu có
         if loader_cfg.get("describe_images"):
@@ -5089,12 +5530,84 @@ Nếu corpus thuần text ngữ nghĩa → Dense-only (FAISS, Chroma, LanceDB) t
                     st.session_state["_query_history"] = []
                     st.rerun()
 
+            _voice_cfg = st.session_state.get("voice_cfg", {
+                "stt_backend": "local_faster_whisper",
+                "auto_run": False,
+                "stt_model_size": "base",
+                "stt_device": "cpu",
+                "stt_compute_type": "int8",
+                "stt_language": "vi",
+                "stt_beam_size": 1,
+                "stt_vad_filter": False,
+            })
+            with st.expander("🎙️ Voice input", expanded=True):
+                st.caption(
+                    "Ghi âm câu hỏi tại đây. Mặc định app dùng faster-whisper local/free; "
+                    "cấu hình backend nằm ở sidebar mục Voice agent local."
+                )
+                _audio = st.audio_input("Ghi âm câu hỏi", key="voice_question_audio")
+                if _audio is not None:
+                    _audio_bytes = _audio.getvalue()
+                    _audio_fp = hashlib.sha256(_audio_bytes).hexdigest()
+                    if st.session_state.get("_last_stt_audio_fp") != _audio_fp:
+                        try:
+                            import time as _voice_time
+
+                            _stt_started = _voice_time.perf_counter()
+                            _backend = _voice_cfg.get("stt_backend", "local_faster_whisper")
+                            if _backend == "elevenlabs":
+                                api_key = _get_env("ELEVENLABS_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
+                                if not api_key:
+                                    st.warning("⚠️ Cần `ELEVENLABS_API_KEY` để dùng ElevenLabs STT.")
+                                    _stt_result = {"text": ""}
+                                else:
+                                    from voice.elevenlabs_stt import transcribe_audio
+
+                                    with st.spinner("Đang transcribe bằng ElevenLabs Scribe v2..."):
+                                        _stt_result = transcribe_audio(
+                                            _audio_bytes,
+                                            api_key=api_key,
+                                            filename=getattr(_audio, "name", "question.wav"),
+                                            mime_type=getattr(_audio, "type", "audio/wav"),
+                                            language_code=_voice_cfg.get("stt_language") or "vi",
+                                        )
+                            else:
+                                from voice.local_stt import transcribe_audio_local
+
+                                with st.spinner("Đang transcribe local bằng faster-whisper..."):
+                                    _stt_result = transcribe_audio_local(
+                                        _audio_bytes,
+                                        filename=getattr(_audio, "name", "question.wav"),
+                                        model_size=_voice_cfg.get("stt_model_size", "base"),
+                                        device=_voice_cfg.get("stt_device", "cpu"),
+                                        compute_type=_voice_cfg.get("stt_compute_type", "int8"),
+                                        language=_voice_cfg.get("stt_language") or "vi",
+                                        beam_size=int(_voice_cfg.get("stt_beam_size", 1)),
+                                        vad_filter=bool(_voice_cfg.get("stt_vad_filter", False)),
+                                    )
+
+                            _transcript = (_stt_result.get("text") or "").strip()
+                            _stt_latency = _voice_time.perf_counter() - _stt_started
+                            if _transcript:
+                                st.session_state["query_pipeline_input"] = _transcript
+                                st.session_state["_last_stt_audio_fp"] = _audio_fp
+                                if _voice_cfg.get("auto_run"):
+                                    st.session_state["_voice_auto_run_query"] = True
+                                st.success(f"Transcript ({_stt_latency:.1f}s): {_transcript}")
+                            elif _backend != "elevenlabs" or (_get_env("ELEVENLABS_API_KEY") or os.getenv("ELEVENLABS_API_KEY")):
+                                st.warning("Không nhận được transcript từ audio này.")
+                        except ModuleNotFoundError:
+                            st.warning("⚠️ Chưa cài `faster-whisper`. Chạy: `pip install faster-whisper`.")
+                        except Exception as e:
+                            st.warning(f"⚠️ STT lỗi: {e}")
+
             _query_input = st.text_input(
                 "Câu hỏi",
                 placeholder="Ví dụ: What are the main contributions of this paper?",
                 key="query_pipeline_input",
             )
             _run_query = st.button("▶️ Run Query Pipeline", key="btn_run_query", type="primary")
+            _run_query = _run_query or st.session_state.pop("_voice_auto_run_query", False)
 
             if _run_query and _query_input.strip():
                 render_query_pipeline_results(
@@ -5107,6 +5620,7 @@ Nếu corpus thuần text ngữ nghĩa → Dense-only (FAISS, Chroma, LanceDB) t
                     prompt_cfg=st.session_state.get("query_prompt_cfg", {"template": "citation", "language": "both"}),
                     gen_cfg=st.session_state.get("query_gen_cfg", {"provider": "openai", "model_name": "gpt-4.1-mini",
                                                                     "temperature": 0.0, "max_tokens": 2048, "streaming": True}),
+                    voice_cfg=st.session_state.get("voice_cfg", {}),
                     history=st.session_state.get("_query_history") if st.session_state.get(
                         "query_prompt_cfg", {}).get("template") == "conversational" else None,
                 )

@@ -49,10 +49,13 @@ class BaseVectorStore(ABC):
     # ── Shared utilities ──────────────────────────────────────────────────────
 
     def _langchain_embedder(self, embedder):
-        """Extract the LangChain Embeddings object from an EmbeddingPipeline."""
+        """Extract the LangChain Embeddings object from local wrapper types."""
         # EmbeddingPipeline exposes .langchain_embedder
         if hasattr(embedder, "langchain_embedder"):
             return embedder.langchain_embedder
+        # BaseEmbedder wrappers expose .embedder
+        if hasattr(embedder, "embedder"):
+            return embedder.embedder
         # Plain LangChain Embeddings object passed directly
         return embedder
 

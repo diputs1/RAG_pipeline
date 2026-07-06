@@ -135,6 +135,39 @@ class PipelineCache:
                 h.update(_sha256_file(p).encode())  # nội dung
         return h.hexdigest()
 
+    def compute_web_input_hash(self, url: str, loader_cfg: dict | None = None) -> str:
+        """
+        Content-based SHA256 hash for a crawled web source.
+
+        Unlike local files, URL content can change without the URL changing. This
+        method performs the same conservative crawl as the web loader and hashes:
+          - included canonical URLs
+          - normalized visible text from included pages
+          - crawl-shaping loader config
+        """
+        from loader.web_loader import VinWondersWebLoader, web_snapshot_hash
+
+        cfg = loader_cfg or {}
+        loader = VinWondersWebLoader(
+            language=cfg.get("language", "vi"),
+            max_depth=int(cfg.get("max_depth", cfg.get("crawl_depth", 1))),
+            max_pages=int(cfg.get("max_pages", 8)),
+            include_keywords=cfg.get("include_keywords") or None,
+            exclude_patterns=cfg.get("exclude_patterns") or None,
+        )
+        snapshot = loader.snapshot(url)
+        content_fp = web_snapshot_hash(snapshot.included_urls, snapshot.combined_text)
+        combined = content_fp + _canonical_json({
+            "source_type": "web",
+            "url": url,
+            "language": cfg.get("language", "vi"),
+            "max_depth": int(cfg.get("max_depth", cfg.get("crawl_depth", 1))),
+            "max_pages": int(cfg.get("max_pages", 8)),
+            "include_keywords": cfg.get("include_keywords"),
+            "exclude_patterns": cfg.get("exclude_patterns"),
+        })
+        return _sha256_str(combined)
+
     def make_step_key(self, prev_key: str, step_cfg: dict) -> str:
         """
         step_key = SHA256(prev_key + canonical_json(step_cfg))
