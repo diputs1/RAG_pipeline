@@ -1,0 +1,20 @@
+{
+  "step": "embedding",
+  "cfg": {
+    "provider": "ollama",
+    "model_name": "nomic-embed-text",
+    "enable_sparse": false,
+    "sparse_method": "bm25",
+    "dimensions": null,
+    "input_type": "search_document",
+    "query_instruction": null,
+    "document_instruction": null
+  },
+  "stats": {
+    "n_vectors": 20,
+    "dims": 768,
+    "has_sparse": false,
+    "truncated": false
+  },
+  "saved_at": "2026-07-06T10:32:02"
+}

@@ -9,7 +9,7 @@
 # ─────────────────────────────────────────────────────
 # (A) BẮT BUỘC — Core app
 # ─────────────────────────────────────────────────────
-streamlit==1.45.1
+streamlit==1.58.0
 python-dotenv==1.0.1
 
 # LangChain
@@ -124,4 +124,7 @@ faiss-cpu==1.9.0.post1
 
 # SPLADE sparse neural (tốt hơn BM25, cần ~500MB model)
 # transformers==4.47.1
-# torch==2.5.1
+# NVIDIA GPU với driver CUDA 12.x:
+# pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+# CPU-only:
+# pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu

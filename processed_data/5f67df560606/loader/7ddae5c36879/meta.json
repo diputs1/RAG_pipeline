@@ -1,0 +1,20 @@
+{
+  "step": "loader",
+  "cfg": {
+    "pdf_strategy": "pypdf",
+    "extract_tables": true,
+    "language": "both",
+    "marker_device": "cpu",
+    "describe_images": false,
+    "vision_model": "gpt-4o-mini",
+    "vision_provider": "openai",
+    "odl_hybrid": null,
+    "odl_struct_tree": false
+  },
+  "stats": {
+    "n_docs": 2,
+    "n_chars": 7546,
+    "source_path": "/tmp/rag_visualizer_uploads"
+  },
+  "saved_at": "2026-07-06T10:31:57"
+}

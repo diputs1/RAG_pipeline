@@ -522,16 +522,23 @@ def _ensure_ollama_model(model_name: str, base_url: str) -> None:
     import ollama as _ollama
 
     host = base_url.rstrip("/")
+    if host.endswith("/v1"):
+        host = host[:-3]
     try:
         client = _ollama.Client(host=host)
-        pulled = {m.model for m in client.list().models}
-        if model_name not in pulled:
+        pulled = {_ollama_model_key(m.model) for m in client.list().models}
+        if _ollama_model_key(model_name) not in pulled:
             client.pull(model_name)   # blocking — chạy trong thread riêng của run_embedder
     except Exception as exc:
         raise RuntimeError(
             f"Không kết nối được Ollama tại `{host}`. "
             f"Đảm bảo Ollama đang chạy (`ollama serve`). Chi tiết: {exc}"
         ) from exc
+
+
+def _ollama_model_key(model_name: str) -> str:
+    """Normalize Ollama names so `foo` matches `foo:latest`."""
+    return model_name.rsplit(":", 1)[0] if model_name.endswith(":latest") else model_name
 
 
 def _ensure_huggingface_model(model_name: str) -> None:
@@ -828,7 +835,8 @@ def _detect_gpu() -> tuple[str, str]:
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
             vram = torch.cuda.get_device_properties(0).total_memory // (1024 ** 2)
-            return "cuda", f"NVIDIA {name} ({vram:,} MB VRAM)"
+            vendor = "" if name.lower().startswith("nvidia") else "NVIDIA "
+            return "cuda", f"{vendor}{name} ({vram:,} MB VRAM)"
         if torch.backends.mps.is_available():
             return "mps", "Apple Silicon MPS"
     except ImportError:
@@ -1768,8 +1776,8 @@ def render_chunking_settings(local_only: bool = False) -> tuple[str, int, int, d
                         if host.endswith("/v1"):
                             host = host[:-3]
                         client     = _ollama.Client(host=host)
-                        pulled     = [m.model for m in client.list().models]
-                        is_present = embedding_model in set(pulled)
+                        pulled     = {_ollama_model_key(m.model) for m in client.list().models}
+                        is_present = _ollama_model_key(embedding_model) in pulled
                         if is_present:
                             st.success(f"✅ Kết nối OK · `{embedding_model}` đã sẵn sàng.")
                         else:
@@ -2258,8 +2266,8 @@ def render_embedding_settings(local_only: bool = False, force_skip: bool = False
                 try:
                     import ollama as _ollama
                     client = _ollama.Client(host=ollama_base_url)
-                    pulled = [m.model for m in client.list().models]
-                    if model_name in set(pulled):
+                    pulled = {_ollama_model_key(m.model) for m in client.list().models}
+                    if _ollama_model_key(model_name) in pulled:
                         st.success(f"✅ Kết nối OK · `{model_name}` đã sẵn sàng.")
                     else:
                         st.warning(
@@ -3717,14 +3725,21 @@ def main():
         .stCaption, .stCaption p {
             font-size: 13px !important;
         }
-        /* Disabled text-area: màu chữ rõ, size lớn hơn */
+        /* Disabled text-area: nền sáng + chữ rõ trong light theme */
         textarea[disabled],
         .stTextArea textarea:disabled {
             color: #1a1a1a !important;
+            background-color: #f8fafc !important;
+            border: 1px solid #cbd5e1 !important;
             font-size: 15px !important;
             line-height: 1.7 !important;
             opacity: 1 !important;
             -webkit-text-fill-color: #1a1a1a !important;
+        }
+        textarea[disabled]::selection,
+        .stTextArea textarea:disabled::selection {
+            background: #bfdbfe !important;
+            color: #111827 !important;
         }
         /* Markdown content */
         .stMarkdown p, .stMarkdown li, .stMarkdown td, .stMarkdown th {
@@ -3964,7 +3979,7 @@ def main():
                 "context_ordering":   ordering,
             }
 
-        with st.expander("🔟 Prompt — xây dựng prompt  *(chạy lúc query)*", expanded=False):
+        with st.expander("🔟 Prompt — xây dựng prompt ", expanded=False):
             st.info(
                 "Chọn template prompt để đưa context vào LLM.\n\n"
                 "- **citation** ← khuyến nghị: yêu cầu trích dẫn [NGUỒN N]\n"
@@ -4004,7 +4019,7 @@ def main():
                 "max_history_turns": prompt_max_hist,
             }
 
-        with st.expander("1️⃣1️⃣ Generation — LLM sinh câu trả lời  *(chạy lúc query)*", expanded=False):
+        with st.expander("1️⃣1️⃣ Generation — LLM sinh câu trả lời", expanded=False):
             st.info(
                 "Chọn LLM để sinh câu trả lời cuối cùng từ prompt đã xây dựng.",
                 icon="ℹ️",

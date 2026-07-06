@@ -1,0 +1,14 @@
+{
+  "step": "vector_db",
+  "cfg": {
+    "provider": "chroma",
+    "collection_name": "rag",
+    "persist_dir": "./storage/chroma"
+  },
+  "stats": {
+    "provider": "chroma",
+    "collection_name": "rag",
+    "n_vectors": 20
+  },
+  "saved_at": "2026-07-06T10:32:02"
+}
